@@ -1,15 +1,16 @@
 use anyhow::Result;
-use pubgrub::range::Range;
+use pubgrub::version_set::VersionSet;
 
+use crate::pubgrub::Range;
 use pep440_rs::{Operator, PreRelease, Version, VersionSpecifier};
 
 use crate::ResolveError;
 
 /// A range of versions that can be used to satisfy a requirement.
 #[derive(Debug)]
-pub(crate) struct PubGrubSpecifier(Range<Version>);
+pub(crate) struct PubGrubSpecifier(Range);
 
-impl From<PubGrubSpecifier> for Range<Version> {
+impl From<PubGrubSpecifier> for Range {
     /// Convert a PubGrub specifier to a range of versions.
     fn from(specifier: PubGrubSpecifier) -> Self {
         specifier.0

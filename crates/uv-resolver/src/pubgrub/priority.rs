@@ -1,9 +1,8 @@
 use std::cmp::Reverse;
 
-use pubgrub::range::Range;
+use crate::pubgrub::Range;
 use rustc_hash::FxHashMap;
 
-use pep440_rs::Version;
 use uv_normalize::PackageName;
 
 use crate::pubgrub::package::PubGrubPackage;
@@ -22,7 +21,7 @@ pub(crate) struct PubGrubPriorities(FxHashMap<PackageName, PubGrubPriority>);
 
 impl PubGrubPriorities {
     /// Add a [`PubGrubPackage`] to the priority map.
-    pub(crate) fn insert(&mut self, package: &PubGrubPackage, version: &Range<Version>) {
+    pub(crate) fn insert(&mut self, package: &PubGrubPackage, version: &Range) {
         let next = self.0.len();
         match package {
             PubGrubPackage::Root(_) => {}
