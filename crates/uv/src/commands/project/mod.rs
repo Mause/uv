@@ -18,8 +18,8 @@ use uv_fs::Simplified;
 use uv_installer::{Downloader, Plan, Planner, SitePackages};
 use uv_interpreter::{find_default_python, Interpreter, PythonEnvironment};
 use uv_requirements::{
-    ExtrasSpecification, LookaheadResolver, NamedRequirementsResolver, RequirementsSpecification,
-    SourceTreeResolver,
+    ExtrasSpecification, LookaheadResolver, NamedRequirementsResolver, ProjectWorkspace,
+    RequirementsSpecification, SourceTreeResolver,
 };
 use uv_resolver::{
     Exclusions, FlatIndex, InMemoryIndex, Manifest, Options, PythonRequirement, ResolutionGraph,
@@ -27,12 +27,10 @@ use uv_resolver::{
 };
 use uv_types::{HashStrategy, InFlight, InstalledPackagesProvider};
 
-use crate::commands::project::discovery::Project;
 use crate::commands::reporters::{DownloadReporter, InstallReporter, ResolverReporter};
 use crate::commands::{elapsed, ChangeEvent, ChangeEventKind};
 use crate::printer::Printer;
 
-mod discovery;
 pub(crate) mod lock;
 pub(crate) mod run;
 pub(crate) mod sync;
@@ -72,11 +70,11 @@ pub(crate) enum Error {
 
 /// Initialize a virtual environment for the current project.
 pub(crate) fn init(
-    project: &Project,
+    project: &ProjectWorkspace,
     cache: &Cache,
     printer: Printer,
 ) -> Result<PythonEnvironment, Error> {
-    let venv = project.root().join(".venv");
+    let venv = project.workspace_root().join(".venv");
 
     // Discover or create the virtual environment.
     // TODO(charlie): If the environment isn't compatible with `--python`, recreate it.

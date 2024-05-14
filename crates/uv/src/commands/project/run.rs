@@ -17,12 +17,13 @@ use uv_configuration::{
 use uv_dispatch::BuildDispatch;
 use uv_installer::{SatisfiesResult, SitePackages};
 use uv_interpreter::PythonEnvironment;
-use uv_requirements::{ExtrasSpecification, RequirementsSource, RequirementsSpecification};
+use uv_requirements::{
+    ExtrasSpecification, ProjectWorkspace, RequirementsSource, RequirementsSpecification,
+};
 use uv_resolver::{FlatIndex, InMemoryIndex, OptionsBuilder};
 use uv_types::{BuildIsolation, HashStrategy, InFlight};
 use uv_warnings::warn_user;
 
-use crate::commands::project::discovery::Project;
 use crate::commands::{project, ExitStatus};
 use crate::printer::Printer;
 
@@ -64,11 +65,7 @@ pub(crate) async fn run(
     } else {
         debug!("Syncing project environment.");
 
-        let Some(project) = Project::find(std::env::current_dir()?)? else {
-            return Err(anyhow::anyhow!(
-                "Unable to find `pyproject.toml` for project."
-            ));
-        };
+        let project = ProjectWorkspace::discover(std::env::current_dir()?)?;
 
         let venv = project::init(&project, cache, printer)?;
 
