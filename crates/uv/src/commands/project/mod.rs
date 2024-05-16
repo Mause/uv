@@ -29,6 +29,7 @@ use uv_types::{HashStrategy, InFlight, InstalledPackagesProvider};
 
 use crate::commands::reporters::{DownloadReporter, InstallReporter, ResolverReporter};
 use crate::commands::{elapsed, ChangeEvent, ChangeEventKind};
+use crate::editables::ResolvedEditables;
 use crate::printer::Printer;
 
 pub(crate) mod lock;
@@ -74,7 +75,7 @@ pub(crate) fn init(
     cache: &Cache,
     printer: Printer,
 ) -> Result<PythonEnvironment, Error> {
-    let venv = project.workspace_root().join(".venv");
+    let venv = project.workspace().root().join(".venv");
 
     // Discover or create the virtual environment.
     // TODO(charlie): If the environment isn't compatible with `--python`, recreate it.
@@ -114,6 +115,7 @@ pub(crate) fn init(
 pub(crate) async fn resolve<InstalledPackages: InstalledPackagesProvider>(
     spec: RequirementsSpecification,
     installed_packages: &InstalledPackages,
+    editables: &ResolvedEditables,
     hasher: &HashStrategy,
     interpreter: &Interpreter,
     tags: &Tags,
@@ -133,13 +135,12 @@ pub(crate) async fn resolve<InstalledPackages: InstalledPackagesProvider>(
     let constraints = Constraints::default();
     let overrides = Overrides::default();
     let python_requirement = PythonRequirement::from_marker_environment(interpreter, markers);
-    let editables = Vec::new();
 
     // Resolve the requirements from the provided sources.
     let requirements = {
         // Convert from unnamed to named requirements.
         let mut requirements = NamedRequirementsResolver::new(
-            spec.requirements,
+            spec.requirements.clone(),
             hasher,
             index,
             DistributionDatabase::new(client, build_dispatch, concurrency.downloads),
@@ -152,7 +153,7 @@ pub(crate) async fn resolve<InstalledPackages: InstalledPackagesProvider>(
         if !spec.source_trees.is_empty() {
             requirements.extend(
                 SourceTreeResolver::new(
-                    spec.source_trees,
+                    spec.source_trees.clone(),
                     &ExtrasSpecification::None,
                     hasher,
                     index,
@@ -168,11 +169,12 @@ pub(crate) async fn resolve<InstalledPackages: InstalledPackagesProvider>(
     };
 
     // Determine any lookahead requirements.
+    let editable_metadata = editables.as_metadata().expect("TODO(merge)");
     let lookaheads = LookaheadResolver::new(
         &requirements,
         &constraints,
         &overrides,
-        &editables,
+        &editable_metadata,
         hasher,
         index,
         DistributionDatabase::new(client, build_dispatch, concurrency.downloads),
@@ -187,8 +189,8 @@ pub(crate) async fn resolve<InstalledPackages: InstalledPackagesProvider>(
         constraints,
         overrides,
         preferences,
-        spec.project,
-        editables,
+        spec.project.clone(),
+        editable_metadata,
         exclusions,
         lookaheads,
     );
@@ -240,6 +242,7 @@ pub(crate) async fn resolve<InstalledPackages: InstalledPackagesProvider>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn install(
     resolution: &Resolution,
+    resolved_editables: ResolvedEditables,
     site_packages: SitePackages<'_>,
     no_binary: &NoBinary,
     link_mode: LinkMode,
@@ -261,6 +264,7 @@ pub(crate) async fn install(
     // Partition into those that should be linked from the cache (`local`), those that need to be
     // downloaded (`remote`), and those that should be removed (`extraneous`).
     let plan = Planner::with_requirements(&requirements)
+        .with_editable_requirements(&resolved_editables.editables)
         .build(
             site_packages,
             &Reinstall::None,

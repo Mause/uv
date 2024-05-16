@@ -17,6 +17,7 @@ use distribution_types::{
 use pep508_rs::{Scheme, UnnamedRequirement, VersionOrUrl};
 use pypi_types::Metadata10;
 use uv_distribution::{DistributionDatabase, Reporter};
+use uv_fs::Simplified;
 use uv_normalize::PackageName;
 use uv_resolver::{InMemoryIndex, MetadataResponse};
 use uv_types::{BuildContext, HashStrategy};
@@ -154,16 +155,16 @@ impl<'a, Context: BuildContext> NamedRequirementsResolver<'a, Context> {
 
                     // Attempt to read a `pyproject.toml` file.
                     let project_path = path.join("pyproject.toml");
-                    if let Some(pyproject) = fs_err::read_to_string(project_path)
+                    if let Some(pyproject) = fs_err::read_to_string(&project_path)
                         .ok()
                         .and_then(|contents| toml::from_str::<PyProjectToml>(&contents).ok())
                     {
                         // Read PEP 621 metadata from the `pyproject.toml`.
                         if let Some(project) = pyproject.project {
                             debug!(
-                                "Found PEP 621 metadata for {path} in `pyproject.toml` ({name})",
-                                path = path.display(),
-                                name = project.name
+                                "Found PEP 621 metadata for {} in: `{}`",
+                                project.name,
+                                project_path.user_display(),
                             );
                             return Ok(pep508_rs::Requirement {
                                 name: project.name,

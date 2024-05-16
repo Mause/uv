@@ -1,10 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use itertools::{Either, Itertools};
+use path_absolutize::Absolutize;
 use rustc_hash::FxHashSet;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, trace};
 
 use cache_key::CanonicalUrl;
 use distribution_types::{
@@ -20,8 +20,9 @@ use uv_configuration::{NoBinary, NoBuild, PreviewMode};
 use uv_fs::Simplified;
 use uv_normalize::{ExtraName, PackageName};
 
+use crate::discovery::ProjectWorkspace;
 use crate::pyproject::{Pep621Metadata, PyProjectToml};
-use crate::{ExtrasSpecification, RequirementsSource};
+use crate::{DiscoverError, ExtrasSpecification, RequirementsSource};
 
 #[derive(Debug, Default)]
 pub struct RequirementsSpecification {
@@ -120,9 +121,34 @@ impl RequirementsSpecification {
                 }
             }
             RequirementsSource::PyprojectToml(path) => {
+                let project_workspace = match ProjectWorkspace::from_project_root(
+                    path.parent().context("pyproject.toml must have a parent")?,
+                ) {
+                    Ok(project_workspace) => project_workspace,
+                    Err(DiscoverError::MissingProject(_)) => {
+                        debug!("Dynamic pyproject.toml at: `{}`", path.user_display());
+                        return Ok(Self {
+                            project: None,
+                            requirements: vec![],
+                            source_trees: vec![path.clone()],
+                            ..Self::default()
+                        });
+                    }
+                    Err(err) => {
+                        return Err(anyhow::Error::new(err).context("Workspace discovery failed"))
+                    }
+                };
+
+                // TODO(konsti): Should we avoid reading pyproject.toml twice?
                 let contents = uv_fs::read_to_string(&path).await?;
-                Self::parse_direct_pyproject_toml(&contents, extras, path.as_ref(), preview)
-                    .with_context(|| format!("Failed to parse `{}`", path.user_display()))?
+                Self::parse_direct_pyproject_toml(
+                    &contents,
+                    &project_workspace,
+                    extras,
+                    path.as_ref(),
+                    preview,
+                )
+                .with_context(|| format!("Failed to parse `{}`", path.user_display()))?
             }
             RequirementsSource::SetupPy(path) | RequirementsSource::SetupCfg(path) => Self {
                 source_trees: vec![path.clone()],
@@ -151,12 +177,11 @@ impl RequirementsSpecification {
     /// support).
     pub(crate) fn parse_direct_pyproject_toml(
         contents: &str,
+        project_workspace: &ProjectWorkspace,
         extras: &ExtrasSpecification,
         pyproject_path: &Path,
         preview: PreviewMode,
     ) -> Result<Self> {
-        let pyproject = toml::from_str::<PyProjectToml>(contents)?;
-
         // We need use this path as base for the relative paths inside pyproject.toml, so
         // we need the absolute path instead of a potentially relative path. E.g. with
         // `foo = { path = "../foo" }`, we will join `../foo` onto this path.
@@ -165,65 +190,94 @@ impl RequirementsSpecification {
             .parent()
             .context("`pyproject.toml` has no parent directory")?;
 
-        let workspace_sources = BTreeMap::default();
-        let workspace_packages = BTreeMap::default();
-        match Pep621Metadata::try_from(
+        // TODO(konsti): Use the `ProjectWorkspace` here too?
+        let pyproject = toml::from_str::<PyProjectToml>(contents)?;
+
+        let Some(project) = Pep621Metadata::try_from(
             pyproject,
             extras,
             pyproject_path,
             project_dir,
-            &workspace_sources,
-            &workspace_packages,
+            project_workspace.workspace(),
             preview,
-        ) {
-            Ok(Some(project)) => {
-                // Partition into editable and non-editable requirements.
-                let (editables, requirements): (Vec<_>, Vec<_>) = project
-                    .requirements
-                    .into_iter()
-                    .partition_map(|requirement| {
-                        if let RequirementSource::Path {
-                            path,
-                            editable: Some(true),
-                            url,
-                        } = requirement.source
-                        {
-                            Either::Left(EditableRequirement {
-                                url,
-                                path,
-                                extras: requirement.extras,
-                                origin: requirement.origin,
-                            })
-                        } else {
-                            Either::Right(UnresolvedRequirementSpecification {
-                                requirement: UnresolvedRequirement::Named(requirement),
-                                hashes: vec![],
-                            })
-                        }
+        )?
+        else {
+            debug!(
+                "Dynamic pyproject.toml at: `{}`",
+                pyproject_path.user_display()
+            );
+            return Ok(Self {
+                project: None,
+                requirements: vec![],
+                source_trees: vec![pyproject_path.to_path_buf()],
+                ..Self::default()
+            });
+        };
+
+        // Consider a requirement on A in a workspace with workspace packages A, B, C where
+        // A -> B and B -> C. We have to perform a DAG traversal to collect all editables.
+        let mut seen_editables: FxHashSet<_> = [project.name.clone()].into_iter().collect();
+        let mut queue = VecDeque::from([project.name.clone()]);
+
+        let mut editables = Vec::new();
+        let mut requirements = Vec::new();
+        let mut used_extras = FxHashSet::default();
+
+        while let Some(project_name) = queue.pop_front() {
+            let Some(current) = &project_workspace.workspace().packages().get(&project_name) else {
+                continue;
+            };
+            trace!("Processing metadata for workspace package {project_name}");
+
+            let project_root_absolute = current
+                .root()
+                .absolutize_from(project_workspace.workspace().root())?;
+            let pyproject = current.pyproject_toml().clone();
+            let project = Pep621Metadata::try_from(
+                pyproject,
+                extras,
+                &project_root_absolute.join("pyproject.toml"),
+                project_root_absolute.as_ref(),
+                project_workspace.workspace(),
+                preview,
+            )? // TODO: error context
+            .expect("TODO(merge): Should we do this in workspace discovery or forward the error?");
+            used_extras.extend(project.used_extras);
+
+            // Partition into editable and non-editable requirements.
+            for requirement in project.requirements {
+                if let RequirementSource::Path {
+                    path,
+                    editable: true,
+                    url,
+                } = requirement.source
+                {
+                    editables.push(EditableRequirement {
+                        url,
+                        path,
+                        extras: requirement.extras,
+                        origin: requirement.origin,
                     });
 
-                Ok(Self {
-                    project: Some(project.name),
-                    editables,
-                    requirements,
-                    extras: project.used_extras,
-                    ..Self::default()
-                })
+                    if seen_editables.insert(requirement.name.clone()) {
+                        queue.push_back(requirement.name.clone());
+                    }
+                } else {
+                    requirements.push(UnresolvedRequirementSpecification {
+                        requirement: UnresolvedRequirement::Named(requirement),
+                        hashes: vec![],
+                    });
+                }
             }
-            Ok(None) => {
-                debug!(
-                    "Dynamic pyproject.toml at: `{}`",
-                    pyproject_path.user_display()
-                );
-                Ok(Self {
-                    project: None,
-                    requirements: vec![],
-                    source_trees: vec![pyproject_path.to_path_buf()],
-                    ..Self::default()
-                })
-            }
-            Err(err) => Err(err.into()),
         }
+
+        Ok(Self {
+            project: Some(project.name),
+            editables,
+            requirements,
+            extras: used_extras,
+            ..Self::default()
+        })
     }
 
     /// Read the combined requirements and constraints from a set of sources.

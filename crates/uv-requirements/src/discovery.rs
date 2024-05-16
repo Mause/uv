@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use glob::{glob, GlobError, PatternError};
 use tracing::{debug, trace};
 
-use uv_fs::Simplified;
+use uv_fs::{absolutize_path, Simplified};
 use uv_normalize::PackageName;
 use uv_warnings::warn_user;
 
@@ -25,11 +25,14 @@ pub enum DiscoverError {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
-    #[error(transparent)]
-    Toml(#[from] toml::de::Error),
+    #[error("Failed to parse: `{}`", _0.user_display())]
+    Toml(PathBuf, #[source] toml::de::Error),
 
     #[error("No `project` section found in: `{}`", _0.simplified_display())]
     MissingProject(PathBuf),
+
+    #[error("Failed to normalize workspace member path")]
+    Normalize(#[source] std::io::Error),
 }
 
 /// A package in a workspace.
@@ -42,21 +45,60 @@ pub struct WorkspaceMember {
     pyproject_toml: PyProjectToml,
 }
 
+impl WorkspaceMember {
+    pub fn root(&self) -> &PathBuf {
+        &self.root
+    }
+
+    pub fn pyproject_toml(&self) -> &PyProjectToml {
+        &self.pyproject_toml
+    }
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct Workspace {
+    /// The path to the workspace root, the directory containing the top level `pyproject.toml` with
+    /// the `uv.tool.workspace`, or the `pyproject.toml` in an implicit single workspace project.
+    root: PathBuf,
+    /// The members of the workspace.
+    packages: BTreeMap<PackageName, WorkspaceMember>,
+    /// The source table for the workspace declaration.
+    sources: BTreeMap<PackageName, Source>,
+}
+
+impl Workspace {
+    /// There is no workspace, use this dummy when resolving.
+    pub fn empty(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            packages: BTreeMap::default(),
+            sources: BTreeMap::default(),
+        }
+    }
+
+    pub fn root(&self) -> &PathBuf {
+        &self.root
+    }
+
+    pub fn packages(&self) -> &BTreeMap<PackageName, WorkspaceMember> {
+        &self.packages
+    }
+
+    pub fn sources(&self) -> &BTreeMap<PackageName, Source> {
+        &self.sources
+    }
+}
+
 /// A package and the workspace it is part of.
 #[derive(Debug, Clone)]
 #[cfg_attr(test, derive(serde::Serialize))]
-#[allow(dead_code)] // TODO(konsti): Resolve workspace package declarations.
 pub struct ProjectWorkspace {
     /// The path to the project root.
     project_root: PathBuf,
     /// The name of the package.
     project_name: PackageName,
-    /// The path to the workspace root.
-    workspace_root: PathBuf,
-    /// The members of the workspace.
-    workspace_packages: BTreeMap<PackageName, WorkspaceMember>,
-    /// The source table for the workspace declaration.
-    workspace_sources: BTreeMap<PackageName, Source>,
+    workspace: Workspace,
 }
 
 impl ProjectWorkspace {
@@ -75,6 +117,21 @@ impl ProjectWorkspace {
         Self::from_project_root(project_root)
     }
 
+    pub fn from_project_root(project_root: &Path) -> Result<Self, DiscoverError> {
+        // Read the `pyproject.toml`.
+        let pyproject_path = project_root.join("pyproject.toml");
+        let contents = fs_err::read_to_string(&pyproject_path)?;
+        let pyproject_toml: PyProjectToml = toml::from_str(&contents)
+            .map_err(|err| DiscoverError::Toml(pyproject_path.clone(), err))?;
+
+        // Extract the `[project]` metadata.
+        let Some(project) = pyproject_toml.project.clone() else {
+            return Err(DiscoverError::MissingProject(pyproject_path.clone()));
+        };
+
+        Self::from_project(project_root, &pyproject_toml, project.name)
+    }
+
     /// The directory containing the closest `pyproject.toml`, containing a `[project]` section.
     pub fn project_root(&self) -> &Path {
         &self.project_root
@@ -84,41 +141,27 @@ impl ProjectWorkspace {
         &self.project_name
     }
 
-    /// The directory containing the workspace root, a directory containing `pyproject.toml` that is
-    /// either an implicit workspace root (identical to the project root) or an explicit
-    /// `[tool.uv.workspace]` entry.
-    pub fn workspace_root(&self) -> &Path {
-        &self.workspace_root
+    pub fn workspace(&self) -> &Workspace {
+        &self.workspace
     }
 
     /// Return the requirements for the project.
     pub fn requirements(&self) -> Vec<RequirementsSource> {
         vec![
             RequirementsSource::from_requirements_file(self.project_root.join("pyproject.toml")),
-            RequirementsSource::from_source_tree(self.project_root.clone()),
+            RequirementsSource::Editable(self.project_root.to_string_lossy().to_string()),
         ]
     }
 
-    fn from_project_root(path: &Path) -> Result<Self, DiscoverError> {
-        let pyproject_path = path.join("pyproject.toml");
-
-        // Read the `pyproject.toml`.
-        let contents = fs_err::read_to_string(&pyproject_path)?;
-        let pyproject_toml: PyProjectToml = toml::from_str(&contents)?;
-
-        // Extract the `[project]` metadata.
-        let Some(project) = pyproject_toml.project.clone() else {
-            return Err(DiscoverError::MissingProject(pyproject_path));
-        };
-
-        Self::from_project(path.to_path_buf(), &pyproject_toml, project.name)
-    }
-
     fn from_project(
-        project_path: PathBuf,
+        project_path: &Path,
         project: &PyProjectToml,
         project_name: PackageName,
     ) -> Result<Self, DiscoverError> {
+        let project_path = absolutize_path(project_path)
+            .map_err(DiscoverError::Normalize)?
+            .to_path_buf();
+
         let mut workspace = project
             .tool
             .as_ref()
@@ -142,22 +185,25 @@ impl ProjectWorkspace {
         let Some((workspace_root, workspace_definition, project_in_workspace_root)) = workspace
         else {
             // The project and the workspace root are identical
-            debug!("No explicit workspace root found");
+            debug!("No explicit workspace root, using project root");
             return Ok(Self {
                 project_root: project_path.clone(),
                 project_name,
-                workspace_root: project_path,
-                workspace_packages: workspace_members,
-                workspace_sources: BTreeMap::default(),
+                workspace: Workspace {
+                    root: project_path,
+                    packages: workspace_members,
+                    // There may be package sources, but we don't need to duplicate them into the
+                    // workspace sources.
+                    sources: BTreeMap::default(),
+                },
             });
         };
 
         debug!("Workspace root: `{}`", workspace_root.simplified_display());
         if workspace_root != project_path {
-            // TODO(konsti): serde error context.
-            let pyproject_toml = toml::from_str(&fs_err::read_to_string(
-                workspace_root.join("pyproject.toml"),
-            )?)?;
+            let contents = fs_err::read_to_string(workspace_root.join("pyproject.toml"))?;
+            let pyproject_toml = toml::from_str(&contents)
+                .map_err(|err| DiscoverError::Toml(workspace_root.join("pyproject.toml"), err))?;
 
             if let Some(project) = &project_in_workspace_root.project {
                 workspace_members.insert(
@@ -181,19 +227,25 @@ impl ProjectWorkspace {
                 // TODO(konsti): Error context? There's no fs_err here.
                 let member_root = member_root
                     .map_err(|err| DiscoverError::Glob(absolute_glob.to_string(), err))?;
+                let member_root = absolutize_path(&member_root)
+                    .map_err(DiscoverError::Normalize)?
+                    .to_path_buf();
+
+                trace!("Processing workspace member {}", member_root.user_display());
+
                 // Read the `pyproject.toml`.
                 let contents = fs_err::read_to_string(&member_root.join("pyproject.toml"))?;
-                let pyproject_toml: PyProjectToml = toml::from_str(&contents)?;
+                let pyproject_toml: PyProjectToml = toml::from_str(&contents)
+                    .map_err(|err| DiscoverError::Toml(member_root.join("pyproject.toml"), err))?;
 
                 // Extract the package name.
                 let Some(project) = pyproject_toml.project.clone() else {
                     return Err(DiscoverError::MissingProject(member_root));
                 };
 
-                // TODO(konsti): serde error context.
-                let pyproject_toml = toml::from_str(&fs_err::read_to_string(
-                    workspace_root.join("pyproject.toml"),
-                )?)?;
+                let contents = fs_err::read_to_string(member_root.join("pyproject.toml"))?;
+                let pyproject_toml = toml::from_str(&contents)
+                    .map_err(|err| DiscoverError::Toml(member_root.join("pyproject.toml"), err))?;
                 let member = WorkspaceMember {
                     root: member_root.clone(),
                     pyproject_toml,
@@ -211,12 +263,41 @@ impl ProjectWorkspace {
         check_nested_workspaces(&workspace_root);
 
         Ok(Self {
-            project_root: project_path,
+            project_root: project_path.clone(),
             project_name,
-            workspace_root,
-            workspace_packages: workspace_members,
-            workspace_sources,
+            workspace: Workspace {
+                root: workspace_root,
+                packages: workspace_members,
+                sources: workspace_sources,
+            },
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dummy(root: &Path, project_name: &PackageName) -> Self {
+        // This doesn't necessarily match the exact test case, but we don't use the other fields
+        // for the test cases atm.
+        let root_member = WorkspaceMember {
+            root: root.to_path_buf(),
+            pyproject_toml: PyProjectToml {
+                project: Some(crate::pyproject::Project {
+                    name: project_name.clone(),
+                    dependencies: None,
+                    optional_dependencies: None,
+                    dynamic: None,
+                }),
+                tool: None,
+            },
+        };
+        Self {
+            project_root: root.to_path_buf(),
+            project_name: project_name.clone(),
+            workspace: Workspace {
+                root: root.to_path_buf(),
+                packages: [(project_name.clone(), root_member)].into_iter().collect(),
+                sources: BTreeMap::default(),
+            },
+        }
     }
 }
 
@@ -224,7 +305,8 @@ impl ProjectWorkspace {
 fn find_workspace(
     project_root: &Path,
 ) -> Result<Option<(PathBuf, ToolUvWorkspace, PyProjectToml)>, DiscoverError> {
-    for workspace_root in project_root.ancestors() {
+    // Skip 1 to skip the project itself.
+    for workspace_root in project_root.ancestors().skip(1) {
         let pyproject_path = workspace_root.join("pyproject.toml");
         if !pyproject_path.exists() {
             continue;
@@ -236,7 +318,8 @@ fn find_workspace(
 
         // Read the `pyproject.toml`.
         let contents = fs_err::read_to_string(&pyproject_path)?;
-        let pyproject_toml: PyProjectToml = toml::from_str(&contents)?;
+        let pyproject_toml: PyProjectToml = toml::from_str(&contents)
+            .map_err(|err| DiscoverError::Toml(pyproject_path.clone(), err))?;
 
         return if let Some(workspace) = pyproject_toml
             .tool
@@ -251,17 +334,17 @@ fn find_workspace(
                 );
                 return Ok(None);
             }
+            let workspace_root = absolutize_path(workspace_root)
+                .map_err(DiscoverError::Normalize)?
+                .to_path_buf();
+
             debug!(
                 "Found workspace root: `{}`",
                 workspace_root.simplified_display()
             );
 
             // We found a workspace root.
-            Ok(Some((
-                workspace_root.to_path_buf(),
-                workspace.clone(),
-                pyproject_toml,
-            )))
+            Ok(Some((workspace_root, workspace.clone(), pyproject_toml)))
         } else if pyproject_toml.project.is_some() {
             // We're in a directory of another project, e.g. tests or examples.
             // Example:
@@ -420,31 +503,33 @@ mod tests {
         assert_json_snapshot!(
             project,
             {
-                ".workspace_packages.*.pyproject_toml" => "[PYPROJECT_TOML]"
+                ".workspace.packages.*.pyproject_toml" => "[PYPROJECT_TOML]"
             },
             @r###"
         {
           "project_root": "[ROOT]/albatross-root-workspace",
           "project_name": "albatross",
-          "workspace_root": "[ROOT]/albatross-root-workspace",
-          "workspace_packages": {
-            "albatross": {
-              "root": "[ROOT]/albatross-root-workspace",
-              "pyproject_toml": "[PYPROJECT_TOML]"
+          "workspace": {
+            "root": "[ROOT]/albatross-root-workspace",
+            "packages": {
+              "albatross": {
+                "root": "[ROOT]/albatross-root-workspace",
+                "pyproject_toml": "[PYPROJECT_TOML]"
+              },
+              "bird-feeder": {
+                "root": "[ROOT]/albatross-root-workspace/packages/bird-feeder",
+                "pyproject_toml": "[PYPROJECT_TOML]"
+              },
+              "seeds": {
+                "root": "[ROOT]/albatross-root-workspace/packages/seeds",
+                "pyproject_toml": "[PYPROJECT_TOML]"
+              }
             },
-            "bird-feeder": {
-              "root": "[ROOT]/albatross-root-workspace/packages/bird-feeder",
-              "pyproject_toml": "[PYPROJECT_TOML]"
-            },
-            "seeds": {
-              "root": "[ROOT]/albatross-root-workspace/packages/seeds",
-              "pyproject_toml": "[PYPROJECT_TOML]"
-            }
-          },
-          "workspace_sources": {
-            "bird-feeder": {
-              "workspace": true,
-              "editable": null
+            "sources": {
+              "bird-feeder": {
+                "workspace": true,
+                "editable": null
+              }
             }
           }
         }
@@ -460,20 +545,22 @@ mod tests {
             assert_json_snapshot!(
             project,
             {
-                ".workspace_packages.*.pyproject_toml" => "[PYPROJECT_TOML]"
+                ".workspace.packages.*.pyproject_toml" => "[PYPROJECT_TOML]"
             },
             @r###"
             {
               "project_root": "[ROOT]/albatross-project-in-excluded",
               "project_name": "albatross",
-              "workspace_root": "[ROOT]/albatross-project-in-excluded",
-              "workspace_packages": {
-                "albatross": {
-                  "root": "[ROOT]/albatross-project-in-excluded",
-                  "pyproject_toml": "[PYPROJECT_TOML]"
-                }
-              },
-              "workspace_sources": {}
+              "workspace": {
+                "root": "[ROOT]/albatross-project-in-excluded",
+                "packages": {
+                  "albatross": {
+                    "root": "[ROOT]/albatross-project-in-excluded",
+                    "pyproject_toml": "[PYPROJECT_TOML]"
+                  }
+                },
+                "sources": {}
+              }
             }
             "###);
         });
@@ -487,31 +574,33 @@ mod tests {
             assert_json_snapshot!(
             project,
             {
-                ".workspace_packages.*.pyproject_toml" => "[PYPROJECT_TOML]"
+                ".workspace.packages.*.pyproject_toml" => "[PYPROJECT_TOML]"
             },
             @r###"
             {
               "project_root": "[ROOT]/albatross-root-workspace",
               "project_name": "albatross",
-              "workspace_root": "[ROOT]/albatross-root-workspace",
-              "workspace_packages": {
-                "albatross": {
-                  "root": "[ROOT]/albatross-root-workspace",
-                  "pyproject_toml": "[PYPROJECT_TOML]"
+              "workspace": {
+                "root": "[ROOT]/albatross-root-workspace",
+                "packages": {
+                  "albatross": {
+                    "root": "[ROOT]/albatross-root-workspace",
+                    "pyproject_toml": "[PYPROJECT_TOML]"
+                  },
+                  "bird-feeder": {
+                    "root": "[ROOT]/albatross-root-workspace/packages/bird-feeder",
+                    "pyproject_toml": "[PYPROJECT_TOML]"
+                  },
+                  "seeds": {
+                    "root": "[ROOT]/albatross-root-workspace/packages/seeds",
+                    "pyproject_toml": "[PYPROJECT_TOML]"
+                  }
                 },
-                "bird-feeder": {
-                  "root": "[ROOT]/albatross-root-workspace/packages/bird-feeder",
-                  "pyproject_toml": "[PYPROJECT_TOML]"
-                },
-                "seeds": {
-                  "root": "[ROOT]/albatross-root-workspace/packages/seeds",
-                  "pyproject_toml": "[PYPROJECT_TOML]"
-                }
-              },
-              "workspace_sources": {
-                "bird-feeder": {
-                  "workspace": true,
-                  "editable": null
+                "sources": {
+                  "bird-feeder": {
+                    "workspace": true,
+                    "editable": null
+                  }
                 }
               }
             }
@@ -531,20 +620,30 @@ mod tests {
             assert_json_snapshot!(
             project,
             {
-                ".workspace_packages.*.pyproject_toml" => "[PYPROJECT_TOML]"
+                ".workspace.packages.*.pyproject_toml" => "[PYPROJECT_TOML]"
             },
             @r###"
             {
               "project_root": "[ROOT]/albatross-virtual-workspace/packages/albatross",
               "project_name": "albatross",
-              "workspace_root": "[ROOT]/albatross-virtual-workspace/packages/albatross",
-              "workspace_packages": {
-                "albatross": {
-                  "root": "[ROOT]/albatross-virtual-workspace/packages/albatross",
-                  "pyproject_toml": "[PYPROJECT_TOML]"
-                }
-              },
-              "workspace_sources": {}
+              "workspace": {
+                "root": "[ROOT]/albatross-virtual-workspace",
+                "packages": {
+                  "albatross": {
+                    "root": "[ROOT]/albatross-virtual-workspace/packages/albatross",
+                    "pyproject_toml": "[PYPROJECT_TOML]"
+                  },
+                  "bird-feeder": {
+                    "root": "[ROOT]/albatross-virtual-workspace/packages/bird-feeder",
+                    "pyproject_toml": "[PYPROJECT_TOML]"
+                  },
+                  "seeds": {
+                    "root": "[ROOT]/albatross-virtual-workspace/packages/seeds",
+                    "pyproject_toml": "[PYPROJECT_TOML]"
+                  }
+                },
+                "sources": {}
+              }
             }
             "###);
         });
@@ -558,20 +657,22 @@ mod tests {
             assert_json_snapshot!(
             project,
             {
-                ".workspace_packages.*.pyproject_toml" => "[PYPROJECT_TOML]"
+                ".workspace.packages.*.pyproject_toml" => "[PYPROJECT_TOML]"
             },
             @r###"
             {
               "project_root": "[ROOT]/albatross-just-project",
               "project_name": "albatross",
-              "workspace_root": "[ROOT]/albatross-just-project",
-              "workspace_packages": {
-                "albatross": {
-                  "root": "[ROOT]/albatross-just-project",
-                  "pyproject_toml": "[PYPROJECT_TOML]"
-                }
-              },
-              "workspace_sources": {}
+              "workspace": {
+                "root": "[ROOT]/albatross-just-project",
+                "packages": {
+                  "albatross": {
+                    "root": "[ROOT]/albatross-just-project",
+                    "pyproject_toml": "[PYPROJECT_TOML]"
+                  }
+                },
+                "sources": {}
+              }
             }
             "###);
         });

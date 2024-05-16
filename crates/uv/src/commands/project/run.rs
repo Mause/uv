@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use itertools::Itertools;
 use tempfile::tempdir_in;
 use tokio::process::Command;
@@ -12,7 +12,7 @@ use install_wheel_rs::linker::LinkMode;
 use uv_cache::Cache;
 use uv_client::{BaseClientBuilder, RegistryClientBuilder};
 use uv_configuration::{
-    Concurrency, ConfigSettings, NoBinary, NoBuild, PreviewMode, SetupPyStrategy,
+    Concurrency, ConfigSettings, NoBinary, NoBuild, PreviewMode, Reinstall, SetupPyStrategy,
 };
 use uv_dispatch::BuildDispatch;
 use uv_installer::{SatisfiesResult, SitePackages};
@@ -25,6 +25,7 @@ use uv_types::{BuildIsolation, HashStrategy, InFlight};
 use uv_warnings::warn_user;
 
 use crate::commands::{project, ExitStatus};
+use crate::editables::ResolvedEditables;
 use crate::printer::Printer;
 
 /// Run a command.
@@ -169,8 +170,10 @@ pub(crate) async fn run(
         "Running `{command}{space}{}`",
         args.iter().map(|arg| arg.to_string_lossy()).join(" ")
     );
-    let mut handle = process.spawn()?;
-    let status = handle.wait().await?;
+    let mut handle = process
+        .spawn()
+        .with_context(|| format!("Failed to spawn: `{command}`"))?;
+    let status = handle.wait().await.context("Child process disappeared")?;
 
     // Exit based on the result of the command
     // TODO(zanieb): Do we want to exit with the code of the child process? Probably.
@@ -259,6 +262,7 @@ async fn update_environment(
     let no_build = NoBuild::default();
     let setup_py = SetupPyStrategy::default();
     let concurrency = Concurrency::default();
+    let reinstall = Reinstall::None;
 
     // Create a build dispatch.
     let build_dispatch = BuildDispatch::new(
@@ -286,10 +290,29 @@ async fn update_environment(
         // .exclude_newer(exclude_newer)
         .build();
 
+    // Build all editable distributions. The editables are shared between resolution and
+    // installation, and should live for the duration of the command. If an editable is already
+    // installed in the environment, we'll still re-build it here.
+    let editables = ResolvedEditables::resolve(
+        spec.editables.clone(),
+        &site_packages,
+        &reinstall,
+        &hasher,
+        &interpreter,
+        tags,
+        cache,
+        &client,
+        &build_dispatch,
+        concurrency,
+        printer,
+    )
+    .await?;
+
     // Resolve the requirements.
     let resolution = match project::resolve(
         spec,
         &site_packages,
+        &editables,
         &hasher,
         &interpreter,
         tags,
@@ -314,6 +337,7 @@ async fn update_environment(
     // Sync the environment.
     project::install(
         &resolution,
+        editables,
         site_packages,
         &no_binary,
         link_mode,

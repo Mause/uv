@@ -124,7 +124,8 @@ fn missing_pyproject_toml() {
     ----- stdout -----
 
     ----- stderr -----
-    error: failed to read from file `pyproject.toml`
+    error: Workspace discovery failed
+      Caused by: failed to open file `pyproject.toml`
       Caused by: No such file or directory (os error 2)
     "###
     );
@@ -144,7 +145,8 @@ fn invalid_pyproject_toml_syntax() -> Result<()> {
     ----- stdout -----
 
     ----- stderr -----
-    error: Failed to parse `pyproject.toml`
+    error: Workspace discovery failed
+      Caused by: Failed to parse: `pyproject.toml`
       Caused by: TOML parse error at line 1, column 5
       |
     1 | 123 - 456
@@ -171,7 +173,8 @@ fn invalid_pyproject_toml_schema() -> Result<()> {
     ----- stdout -----
 
     ----- stderr -----
-    error: Failed to parse `pyproject.toml`
+    error: Workspace discovery failed
+      Caused by: Failed to parse: `pyproject.toml`
       Caused by: TOML parse error at line 1, column 1
       |
     1 | [project]

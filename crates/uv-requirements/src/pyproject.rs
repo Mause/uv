@@ -29,7 +29,7 @@ use uv_git::GitReference;
 use uv_normalize::{ExtraName, PackageName};
 use uv_warnings::warn_user_once;
 
-use crate::ExtrasSpecification;
+use crate::{ExtrasSpecification, Workspace};
 
 #[derive(Debug, Error)]
 pub enum Pep621Error {
@@ -61,8 +61,8 @@ pub enum LoweringError {
     InvalidUrl(#[from] url::ParseError),
     #[error("Can't combine URLs from both `project.dependencies` and `tool.uv.sources`")]
     ConflictingUrls,
-    #[error("Could not normalize path: `{0}`")]
-    AbsolutizeError(String, #[source] io::Error),
+    #[error("Could not normalize path: `{}`", _0.user_display())]
+    AbsolutizeError(PathBuf, #[source] io::Error),
     #[error("Fragments are not allowed in URLs: `{0}`")]
     ForbiddenFragment(Url),
     #[error("`workspace = false` is not yet supported")]
@@ -238,8 +238,7 @@ impl Pep621Metadata {
         extras: &ExtrasSpecification,
         pyproject_path: &Path,
         project_dir: &Path,
-        workspace_sources: &BTreeMap<PackageName, Source>,
-        workspace_packages: &BTreeMap<PackageName, String>,
+        workspace: &Workspace,
         preview: PreviewMode,
     ) -> Result<Option<Self>, Pep621Error> {
         let project_sources = pyproject
@@ -248,7 +247,7 @@ impl Pep621Metadata {
             .and_then(|tool| tool.uv.as_ref())
             .and_then(|uv| uv.sources.clone());
 
-        let has_sources = project_sources.is_some() || !workspace_sources.is_empty();
+        let has_sources = project_sources.is_some() || !workspace.sources().is_empty();
 
         let Some(project) = pyproject.project else {
             return if has_sources {
@@ -284,8 +283,7 @@ impl Pep621Metadata {
             &project.name,
             project_dir,
             &project_sources.unwrap_or_default(),
-            workspace_sources,
-            workspace_packages,
+            workspace,
             preview,
         )?;
 
@@ -324,8 +322,7 @@ pub(crate) fn lower_requirements(
     project_name: &PackageName,
     project_dir: &Path,
     project_sources: &BTreeMap<PackageName, Source>,
-    workspace_sources: &BTreeMap<PackageName, Source>,
-    workspace_packages: &BTreeMap<PackageName, String>,
+    workspace: &Workspace,
     preview: PreviewMode,
 ) -> Result<Requirements, Pep621Error> {
     let dependencies = dependencies
@@ -340,8 +337,7 @@ pub(crate) fn lower_requirements(
                 project_name,
                 project_dir,
                 project_sources,
-                workspace_sources,
-                workspace_packages,
+                workspace,
                 preview,
             )
             .map_err(|err| Pep621Error::LoweringError(name, err))
@@ -365,8 +361,7 @@ pub(crate) fn lower_requirements(
                         project_name,
                         project_dir,
                         project_sources,
-                        workspace_sources,
-                        workspace_packages,
+                        workspace,
                         preview,
                     )
                     .map_err(|err| Pep621Error::LoweringError(name, err))
@@ -387,29 +382,31 @@ pub(crate) fn lower_requirement(
     project_name: &PackageName,
     project_dir: &Path,
     project_sources: &BTreeMap<PackageName, Source>,
-    workspace_sources: &BTreeMap<PackageName, Source>,
-    workspace_packages: &BTreeMap<PackageName, String>,
+    workspace: &Workspace,
     preview: PreviewMode,
 ) -> Result<Requirement, LoweringError> {
     let source = project_sources
         .get(&requirement.name)
-        .or(workspace_sources.get(&requirement.name))
+        .or(workspace.sources().get(&requirement.name))
         .cloned();
 
-    if !matches!(
+    let is_workspace_dep = matches!(
         source,
         Some(Source::Workspace {
             // By using toml, we technically support `workspace = false`.
             workspace: true,
             ..
         })
-    ) && workspace_packages.contains_key(&requirement.name)
+    );
+    if !is_workspace_dep && workspace.packages().contains_key(&requirement.name)
+        // Support reclusive self-inclusion (extras that activate other extras).
+        && &requirement.name != project_name
     {
         return Err(LoweringError::UndeclaredWorkspacePackage);
     }
 
     let Some(source) = source else {
-        let has_sources = !project_sources.is_empty() || !workspace_sources.is_empty();
+        let has_sources = !project_sources.is_empty() || !workspace.sources().is_empty();
         // Support recursive editable inclusions.
         if has_sources && requirement.version_or_url.is_none() && &requirement.name != project_name
         {
@@ -496,7 +493,7 @@ pub(crate) fn lower_requirement(
             if matches!(requirement.version_or_url, Some(VersionOrUrl::Url(_))) {
                 return Err(LoweringError::ConflictingUrls);
             }
-            path_source(path, project_dir, editable)?
+            path_source(Path::new(&path), project_dir, editable.unwrap_or(false))?
         }
         Source::Registry { index } => match requirement.version_or_url {
             None => {
@@ -516,20 +513,21 @@ pub(crate) fn lower_requirement(
             Some(VersionOrUrl::Url(_)) => return Err(LoweringError::ConflictingUrls),
         },
         Source::Workspace {
-            workspace,
+            workspace: is_workspace,
             editable,
         } => {
-            if !workspace {
+            if !is_workspace {
                 return Err(LoweringError::WorkspaceFalse);
             }
             if matches!(requirement.version_or_url, Some(VersionOrUrl::Url(_))) {
                 return Err(LoweringError::ConflictingUrls);
             }
-            let path = workspace_packages
+            let path = workspace
+                .packages()
                 .get(&requirement.name)
                 .ok_or(LoweringError::UndeclaredWorkspacePackage)?
                 .clone();
-            path_source(path, project_dir, editable)?
+            path_source(path.root(), workspace.root(), editable.unwrap_or(true))?
         }
         Source::CatchAll { .. } => {
             // Emit a dedicated error message, which is an improvement over Serde's default error.
@@ -547,15 +545,16 @@ pub(crate) fn lower_requirement(
 
 /// Convert a path string to a path section.
 fn path_source(
-    path: String,
+    path: &Path,
     project_dir: &Path,
-    editable: Option<bool>,
+    editable: bool,
 ) -> Result<RequirementSource, LoweringError> {
-    let url = VerbatimUrl::parse_path(&path, project_dir).with_given(path.clone());
+    let url =
+        VerbatimUrl::parse_path(path, project_dir).with_given(path.to_string_lossy().to_string());
     let path_buf = PathBuf::from(&path);
     let path_buf = path_buf
         .absolutize_from(project_dir)
-        .map_err(|err| LoweringError::AbsolutizeError(path, err))?
+        .map_err(|err| LoweringError::AbsolutizeError(path.to_path_buf(), err))?
         .to_path_buf();
     Ok(RequirementSource::Path {
         path: path_buf,
@@ -656,6 +655,7 @@ mod serde_from_and_to_string {
 #[cfg(test)]
 mod test {
     use std::path::Path;
+    use std::str::FromStr;
 
     use anyhow::Context;
     use indoc::indoc;
@@ -663,7 +663,9 @@ mod test {
 
     use uv_configuration::PreviewMode;
     use uv_fs::Simplified;
+    use uv_normalize::PackageName;
 
+    use crate::discovery::ProjectWorkspace;
     use crate::{ExtrasSpecification, RequirementsSpecification};
 
     fn from_source(
@@ -674,6 +676,7 @@ mod test {
         let path = uv_fs::absolutize_path(path.as_ref())?;
         RequirementsSpecification::parse_direct_pyproject_toml(
             contents,
+            &ProjectWorkspace::dummy(path.as_ref(), &PackageName::from_str("foo").unwrap()),
             extras,
             path.as_ref(),
             PreviewMode::Enabled,
@@ -796,7 +799,7 @@ mod test {
               "tqdm",
             ]
         "#};
-
+        from_source(input, "pyproject.toml", &ExtrasSpecification::None).unwrap();
         assert!(from_source(input, "pyproject.toml", &ExtrasSpecification::None).is_ok());
     }
 

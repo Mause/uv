@@ -66,14 +66,15 @@ impl VerbatimUrl {
 
     /// Parse a URL from an absolute or relative path.
     #[cfg(feature = "non-pep508-extensions")] // PEP 508 arguably only allows absolute file URLs.
-    pub fn parse_path(path: impl AsRef<Path>, working_dir: impl AsRef<Path>) -> Self {
+    pub fn parse_path(path: impl AsRef<Path>, base_dir: impl AsRef<Path>) -> Self {
+        debug_assert!(base_dir.as_ref().is_absolute(), "base dir must be absolute");
         let path = path.as_ref();
 
         // Convert the path to an absolute path, if necessary.
         let path = if path.is_absolute() {
             path.to_path_buf()
         } else {
-            working_dir.as_ref().join(path)
+            base_dir.as_ref().join(path)
         };
 
         // Normalize the path.
@@ -87,7 +88,7 @@ impl VerbatimUrl {
             panic!(
                 "path is absolute: {}, {}",
                 path.display(),
-                working_dir.as_ref().display()
+                base_dir.as_ref().display()
             )
         });
 
