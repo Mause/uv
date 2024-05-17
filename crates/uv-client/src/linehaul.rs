@@ -83,6 +83,8 @@ impl LineHaul {
         // Build Distro as Linehaul expects.
         let distro: Option<Distro> = if cfg!(target_os = "linux") {
             // Gather distribution info from /etc/os-release.
+            None
+            /*
             sys_info::linux_os_release().ok().map(|info| Distro {
                 // e.g., Jammy, Focal, etc.
                 id: info.version_codename,
@@ -93,6 +95,7 @@ impl LineHaul {
                 // e.g., glibc 2.38, musl 1.2
                 libc,
             })
+            */
         } else if cfg!(target_os = "macos") {
             let version = match platform.map(|platform| platform.os()) {
                 Some(Os::Macos { major, minor }) => Some(format!("{major}.{minor}")),
