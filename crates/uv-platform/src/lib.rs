@@ -18,7 +18,7 @@ mod os;
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("Unknown operating system: {0}")]
+    #[error("uv-platform Unknown operating system: {0}")]
     UnknownOs(String),
     #[error("Unknown architecture: {0}")]
     UnknownArch(String),
