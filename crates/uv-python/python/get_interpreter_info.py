@@ -481,6 +481,8 @@ def get_operating_system_and_architecture():
                 "name": "android",
                 "api_level": sys.getandroidapilevel(),
             }
+            if architecture == "arm64_v8a":
+                architecture = "aarch64"
         else:
             print(json.dumps({"result": "error", "kind": "libc_not_found"}))
             sys.exit(0)
