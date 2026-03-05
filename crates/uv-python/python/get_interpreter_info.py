@@ -446,7 +446,7 @@ def get_operating_system_and_architecture():
         )
         sys.exit(0)
 
-    if operating_system == "linux":
+    if operating_system == "linux" or operating_system == "android":
         # noinspection PyProtectedMember
         from .packaging._manylinux import _get_glibc_version
 
