@@ -723,7 +723,8 @@ impl RegistryClient {
                 return Err(Error::from(ErrorKind::Io(err)));
             }
         };
-        let metadata = SimpleDetailMetadata::from_json(&text, package_name, url)?;
+        let files = serde::deserialize(&text)?;
+        let metadata = SimpleDetailMetadata::from_pypi_files(files, package_name, ProjectStatus::Fresh, url);
         OwnedArchive::from_unarchived(&metadata)
     }
 
