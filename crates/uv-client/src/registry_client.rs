@@ -711,7 +711,7 @@ impl RegistryClient {
         let path = url
             .to_file_path()
             .map_err(|()| ErrorKind::NonFileUrl(url.clone()))?
-            .join("index.html");
+            .join("json");
         let text = match fs_err::tokio::read_to_string(&path).await {
             Ok(text) => text,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -723,7 +723,7 @@ impl RegistryClient {
                 return Err(Error::from(ErrorKind::Io(err)));
             }
         };
-        let metadata = SimpleDetailMetadata::from_html(&text, package_name, url)?;
+        let metadata = SimpleDetailMetadata::from_json(&text, package_name, url)?;
         OwnedArchive::from_unarchived(&metadata)
     }
 
