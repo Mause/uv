@@ -711,7 +711,7 @@ impl RegistryClient {
         let path = url
             .to_file_path()
             .map_err(|()| ErrorKind::NonFileUrl(url.clone()))?
-            .join("index.html");
+            .join("json");
         let text = match fs_err::tokio::read_to_string(&path).await {
             Ok(text) => text,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -723,7 +723,14 @@ impl RegistryClient {
                 return Err(Error::from(ErrorKind::Io(err)));
             }
         };
-        let metadata = SimpleDetailMetadata::from_html(&text, package_name, url)?;
+        let data: PypiSimpleDetail = serde_json::from_slice(&text)
+            .map_err(|err| Error::from_json_err(err, url.clone()))?;
+        let metadata = SimpleDetailMetadata::from_pypi_files(
+            data.files,
+            package_name,
+            data.project_status,
+            url,
+        );
         OwnedArchive::from_unarchived(&metadata)
     }
 
