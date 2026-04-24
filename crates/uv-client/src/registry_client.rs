@@ -723,7 +723,8 @@ impl RegistryClient {
                 return Err(Error::from(ErrorKind::Io(err)));
             }
         };
-        let files: PypiSimpleDetail = serde_json::from_str(&text).unwrap();
+        let files: PypiSimpleDetail = serde_json::from_slice(&text)
+            .map_err(|err| Error::from_json_err(err, url.clone()))?;
         let metadata = SimpleDetailMetadata::from_pypi_files(
             files.files,
             package_name,
